@@ -268,6 +268,7 @@ class PipelineCPU:
 
         self.ex_mem = cur
 
+    
     def stage_id(self):
         prev = self.if_id
         cur = PipelineReg()
@@ -303,7 +304,36 @@ class PipelineCPU:
         else:
             cur.alu_a, cur.alu_b = 0, 0
 
+        # ---- Early forwarding at ID to cover ALU->ALU gaps ----
+        def fwd_val(reg):
+            if reg is None or reg == 0:
+                return None
+            # Prefer EX/MEM ALU results (not loads)
+            if self.ex_mem.reg_write and self.ex_mem.write_reg == reg and not self.ex_mem.mem_to_reg:
+                return self.ex_mem.alu_out
+            # Then MEM/WB write-back (ALU or load)
+            if self.mem_wb.reg_write and self.mem_wb.write_reg == reg:
+                return self.mem_wb.write_val
+            return None
+
+        # Apply to operands where appropriate
+        if op in ("ADD", "SUB", "ADDI", "LW", "SW", "BEQ"):
+            va = fwd_val(cur.rs)
+            if va is not None:
+                cur.alu_a = va
+            # ops that use rt as an operand
+            if op in ("ADD", "SUB", "BEQ"):
+                vb = fwd_val(cur.rt)
+                if vb is not None:
+                    cur.alu_b = vb
+            # store data forwarding for SW
+            if op == "SW":
+                vs = fwd_val(cur.rt)
+                if vs is not None:
+                    cur.store_val = vs
+
         self.id_ex = cur
+
 
     def stage_if(self, stall: bool, flush: bool):
         if flush:
@@ -345,23 +375,29 @@ class PipelineCPU:
     def step(self):
         self.cycle += 1
 
-        # Control hazard: discovered in last EX (now in EX/MEM latch)
-        flush = (self.ex_mem.instr is not None and self.ex_mem.taken_branch)
-
         # Data hazard: load-use between ID/EX (load) and IF/ID (consumer)
         stall = self._load_use_hazard()
 
-        # WB -> MEM -> EX -> ID -> IF
+        # Progress pipeline back-to-front
         self.stage_wb()
         self.stage_mem()
         self.stage_ex()
 
-        if stall:
-            # Insert bubble into ID/EX, hold IF/ID
+        # Control hazard: evaluate *current* EX result (now in ex_mem)
+        flush = (self.ex_mem.instr is not None and self.ex_mem.taken_branch)
+
+        # On a taken branch, squash the instruction currently in IF/ID (don't advance it into ID/EX)
+        if flush:
             self.id_ex = PipelineReg()
         else:
-            self.stage_id()
+            # ID stage (or bubble on stall)
+            if stall:
+                # Insert bubble into ID/EX, hold IF/ID
+                self.id_ex = PipelineReg()
+            else:
+                self.stage_id()
 
+        # IF stage sees *current-cycle* flush
         self.stage_if(stall=stall, flush=flush)
 
         # Retire at WB
